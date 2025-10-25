@@ -66,7 +66,7 @@ bash rock_that_bird.sh "{GPU_TO_USE}" # By default: bash rock_that_bird.sh "0"
 ## Solution Description
 
 - [Kaggle Discussion](https://www.kaggle.com/competitions/birdclef-2025/discussion/583699)
-- Paper: TODO
+- [Tackling Domain Shift in Bird Audio Classification via Transfer Learning and Semi-Supervised Distillation: A Case Study on BirdCLEF+ 2025](https://ceur-ws.org/Vol-4038/paper_256.pdf)
 
 ## Detailed (Advanced) Code Description
 
