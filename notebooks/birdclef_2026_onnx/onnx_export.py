@@ -35,7 +35,7 @@ CLIP_SAMP   = SR * CLIP_SEC      # 160_000
 HOP_LENGTH  = 512
 MEL_T       = CLIP_SAMP // HOP_LENGTH + 1  # 313 frames
 MEL_N       = 128
-OPSET       = 17
+OPSET       = 18   # 18+ avoids the dynamo down-conversion warning; ORT 1.16+ supports it
 
 # List every checkpoint you want to use at inference time.
 # arch ∈ {'v2s', 'nfnet'}.  The output filename is  f'{arch}__{stem}.onnx'.
@@ -128,10 +128,11 @@ def export_one(ckpt_path, arch, out_path):
     model.eval()
 
     dummy = torch.randn(1, 1, MEL_N, MEL_T)
+    batch = torch.export.Dim('batch', min=1, max=64)
     torch.onnx.export(
-        model, dummy, str(out_path),
+        model, (dummy,), str(out_path),
         input_names=['spec'], output_names=['logits'],
-        dynamic_axes={'spec': {0: 'batch'}, 'logits': {0: 'batch'}},
+        dynamic_shapes={'x': {0: batch}},
         opset_version=OPSET, do_constant_folding=True,
     )
 
