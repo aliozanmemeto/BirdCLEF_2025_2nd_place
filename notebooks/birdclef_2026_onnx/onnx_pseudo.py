@@ -70,6 +70,50 @@ MEL_CFG = dict(
 
 # ── INSTALL onnxruntime ───────────────────────────────────────────────────────
 
+def _preload_nvidia_cuda_libs():
+    """onnxruntime-gpu (CUDA 12 build) expects libcublasLt.so.12 etc. on the
+    loader path, but Kaggle ships CUDA via pip packages (nvidia-cublas-cu12,
+    nvidia-cudnn-cu12, ...) that aren't on LD_LIBRARY_PATH. We discover them
+    in site-packages, prepend them to LD_LIBRARY_PATH, and ctypes-preload the
+    key .so files so any later dlopen() from ORT resolves.
+    Must run BEFORE `import onnxruntime`.
+    """
+    import sys, pathlib, ctypes, glob
+    roots = []
+    for sp in sys.path:
+        p = pathlib.Path(sp) / 'nvidia'
+        if p.exists():
+            roots.append(p)
+    lib_dirs = []
+    for r in roots:
+        for sub in r.iterdir():
+            lib = sub / 'lib'
+            if lib.exists():
+                lib_dirs.append(str(lib))
+    if not lib_dirs:
+        return []
+
+    import os as _os
+    current = _os.environ.get('LD_LIBRARY_PATH', '')
+    _os.environ['LD_LIBRARY_PATH'] = ':'.join(lib_dirs + ([current] if current else []))
+
+    preload_order = [
+        'libcudart.so*', 'libnvrtc.so*', 'libcublasLt.so*', 'libcublas.so*',
+        'libcufft.so*', 'libcurand.so*', 'libcusparse.so*', 'libcusolver.so*',
+        'libnvJitLink.so*', 'libcudnn*.so*',
+    ]
+    loaded = []
+    for d in lib_dirs:
+        for pat in preload_order:
+            for so in sorted(glob.glob(_os.path.join(d, pat))):
+                try:
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                    loaded.append(_os.path.basename(so))
+                except OSError:
+                    pass
+    return loaded
+
+
 def install_onnxruntime():
     try:
         import onnxruntime  # noqa: F401
@@ -89,11 +133,15 @@ def install_onnxruntime():
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f'Both installs failed: {r.stderr[-400:]}')
-    import onnxruntime  # noqa: F401
     print(f'onnxruntime installed from {WHEELS_DIR}')
 
 
 install_onnxruntime()
+_preloaded = _preload_nvidia_cuda_libs()
+if _preloaded:
+    print(f'Preloaded {len(_preloaded)} CUDA libs (cublasLt, cudnn, ...)')
+else:
+    print('No nvidia-* CUDA libs found in site-packages — ORT will use CPU only')
 import onnxruntime as ort
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
