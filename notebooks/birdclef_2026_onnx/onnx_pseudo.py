@@ -43,21 +43,14 @@ ONNX_FOLD_PATHS = [
     MODELS_DIR / 'v2s__best_sed_atthead_ns_fold4.onnx',
 ]
 
-FOLD_SEED = 2
+FOLD_SEED = 1215          # MUST match training SEED
 N_FOLDS   = 5
+MAX_TOTAL_FILES           = 2        # training compute_protected_files()
+ALSO_PROTECT_SOLE_SC      = True     # training compute_protected_files()
 
-PROTECTED_FILES = {
-    'BC2026_Train_0001_S08_20250606_030007.ogg',
-    'BC2026_Train_0002_S08_20250607_030007.ogg',
-    'BC2026_Train_0003_S08_20250607_070007.ogg',
-    'BC2026_Train_0004_S08_20250607_070007.ogg',
-    'BC2026_Train_0005_S08_20250607_070007.ogg',
-    'BC2026_Train_0058_S15_20250617_060100.ogg',
-    'BC2026_Train_0062_S19_20241213_193000.ogg',
-    'BC2026_Train_0063_S19_20241214_190000.ogg',
-    'BC2026_Train_0064_S23_20241124_032002.ogg',
-    'BC2026_Train_0065_S23_20241124_040002.ogg',
-}
+# Duplicate cleanup CSV — must match training so train_counts feeding the
+# protected-files computation is identical.
+DUP_CSV_PATH = Path('/kaggle/input/datasets/vecihegrler/alsdkkldsaldks/duplicates.csv')
 
 PRIMARY_LABEL_MIN_PROB = 0.5
 TRIM_MIN_PROB          = 0.1
@@ -131,29 +124,96 @@ class Spectrogram(nn.Module):
         return (mel - norm_min) / (norm_max - norm_min + eps)
 
 
-# ── FOLD ASSIGNMENT ───────────────────────────────────────────────────────────
+# ── TRAINING DATA-ENG REPLICATION (must be byte-identical to training) ──────
 
-def soundscape_folds(sc, n_splits=5, seed=FOLD_SEED, protected=None):
-    """EXACT match to training — must use same seed/logic."""
+def apply_duplicate_cleanup(train_df, dup_csv_path):
+    """Byte-identical to training apply_duplicate_cleanup()."""
+    if dup_csv_path is None or not Path(dup_csv_path).exists():
+        print(f'  Duplicate cleanup SKIPPED (no {dup_csv_path})'); return train_df
+    dup = pd.read_csv(dup_csv_path)
+    dup['_species'] = dup['filename'].apply(lambda fn: fn.split('/')[0])
+    to_drop = set(); n_conflict = n_redundant = 0
+    for _, group in dup.groupby('hash'):
+        if group['_species'].nunique() > 1:
+            to_drop.update(group['filename']); n_conflict += len(group)
+        else:
+            canonical = sorted(group['filename'])[0]
+            extras = set(group['filename']) - {canonical}
+            to_drop.update(extras); n_redundant += len(extras)
+    before = len(train_df)
+    train_df = train_df[~train_df['filename'].isin(to_drop)].reset_index(drop=True)
+    print(f'  Duplicate cleanup: {before} -> {len(train_df)} '
+          f'({n_conflict} cross-species + {n_redundant} redundant)')
+    return train_df
+
+
+def compute_protected_files(sc_df, train_df, label2idx,
+                            max_total_files=MAX_TOTAL_FILES,
+                            also_protect_sole_sc=ALSO_PROTECT_SOLE_SC):
+    """Byte-identical to training compute_protected_files()."""
+    sp_to_scfiles = {}
+    for _, r in sc_df.iterrows():
+        for sp in str(r.primary_label).split(';'):
+            sp = sp.strip()
+            if sp and sp in label2idx:
+                sp_to_scfiles.setdefault(sp, set()).add(r.filename)
+    train_counts = train_df['primary_label'].value_counts()
+    fragile = {sp for sp, files in sp_to_scfiles.items()
+               if len(files) + int(train_counts.get(sp, 0)) <= max_total_files}
+    to_protect = set(fragile)
+    if also_protect_sole_sc:
+        sole_sc = {sp for sp, files in sp_to_scfiles.items() if len(files) == 1}
+        to_protect |= sole_sc
+    protected = set()
+    for sp in to_protect:
+        protected.update(sp_to_scfiles[sp])
+    n_sole_added = len(to_protect - fragile) if also_protect_sole_sc else 0
+    print(f'  Fragile ≤{max_total_files}: {len(fragile)} species')
+    print(f'  + Sole-sc species: {n_sole_added} more')
+    print(f'  Total: {len(to_protect)} species, {len(protected)} protected files')
+    return protected
+
+
+def soundscape_folds(sc_df, n_splits=5, seed=FOLD_SEED, protected=None):
+    """BYTE-IDENTICAL to training soundscape_folds().
+    Key points vs the previous pseudo version:
+      - seed = training SEED (1215), not 2
+      - uses the per-site random OFFSET (rng.randint(n_splits)) — without
+        this, the fold that fold N is 'val' in training will not match here
+    """
     protected = protected or set()
-    sc = sc[~sc['filename'].isin(protected)].copy()
-    sc['site'] = sc['filename'].apply(
+    non = sc_df[~sc_df['filename'].isin(protected)].copy()
+    non['site'] = non['filename'].apply(
         lambda fn: fn.split('_')[3] if len(fn.split('_')) > 3 else fn.split('_')[0]
     )
     rng = np.random.RandomState(seed)
-    fold_map = {i: [] for i in range(n_splits)}
-    for site, grp in sc.groupby('site'):
+    fm = {i: [] for i in range(n_splits)}
+    for _, grp in non.groupby('site'):
         files = grp['filename'].unique().tolist()
         rng.shuffle(files)
+        offset = rng.randint(n_splits)
         for i, fn in enumerate(files):
-            fold_map[i % n_splits].append(fn)
-    return fold_map
+            fm[(i + offset) % n_splits].append(fn)
+    return fm
 
 
-def build_fold_id_map():
+def build_fold_id_map(label2idx):
+    """Replicates the training data-eng pipeline end to end:
+       1. load train.csv + dup cleanup
+       2. load sc labels (same dedup as training)
+       3. compute PROTECTED_FILES dynamically
+       4. fold the NON-protected soundscapes with the same seed + offset logic
+    Returns (fold_id_map, protected_files_set).
+    """
+    train_audio = pd.read_csv(ROOT / 'train.csv')
+    train_audio = apply_duplicate_cleanup(train_audio, DUP_CSV_PATH)
+
     sc_labels = pd.read_csv(ROOT / 'train_soundscapes_labels.csv')
     sc_labels = sc_labels.drop_duplicates(subset=['filename', 'start', 'end'])
-    train_fold_map = soundscape_folds(sc_labels, N_FOLDS, FOLD_SEED, protected=PROTECTED_FILES)
+
+    protected = compute_protected_files(sc_labels, train_audio, label2idx)
+
+    train_fold_map = soundscape_folds(sc_labels, N_FOLDS, FOLD_SEED, protected=protected)
 
     fold_id_map = {}
     for fold_i, files in train_fold_map.items():
@@ -168,11 +228,11 @@ def build_fold_id_map():
 
     from collections import Counter
     dist = Counter(fold_id_map.values())
-    print(f'Fold distribution across {len(fold_id_map)} soundscapes:')
+    print(f'\nFold distribution across {len(fold_id_map)} soundscapes:')
     for fold_i in sorted(dist.keys()):
         label = 'UNLABELED (ensemble)' if fold_i == -1 else f'fold {fold_i} (OOF single)'
         print(f'  {label}: {dist[fold_i]}')
-    return fold_id_map
+    return fold_id_map, protected
 
 
 # ── ONNX SESSIONS ─────────────────────────────────────────────────────────────
@@ -240,15 +300,15 @@ def sigmoid_np(x):
 def run():
     print(f'Device (torch / mel): {DEVICE}')
 
-    print('Building fold_id map...')
-    fold_id_map = build_fold_id_map()
-
-    print('\nLoading ONNX sessions...')
-    sessions = load_sessions()
-
     label2idx  = load_label2idx()
     label_cols = [l for l, _ in sorted(label2idx.items(), key=lambda x: x[1])]
     print(f'  label2idx: {len(label2idx)} classes')
+
+    print('\nBuilding fold_id map (replicating training data-eng pipeline)...')
+    fold_id_map, protected_files = build_fold_id_map(label2idx)
+
+    print('\nLoading ONNX sessions...')
+    sessions = load_sessions()
 
     mel = Spectrogram(**MEL_CFG).to(DEVICE).eval()
 
@@ -264,7 +324,7 @@ def run():
     for i, fpath in enumerate(files):
         stem = fpath.stem
 
-        if fpath.name in PROTECTED_FILES:
+        if fpath.name in protected_files:
             skipped_protected += 1
             continue
 
