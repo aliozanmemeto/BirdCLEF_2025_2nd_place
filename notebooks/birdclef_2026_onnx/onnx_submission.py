@@ -78,86 +78,42 @@ SMOOTH_EVENT   = np.array([0.20, 0.60, 0.20])
 SMOOTH_TEXTURE = np.array([0.35, 0.30, 0.35])
 
 
-# ── INSTALL onnxruntime FROM LOCAL WHEELS ────────────────────────────────────
+# ── INSTALL onnxruntime FROM LOCAL WHEELS (CPU-ONLY) ──────────────────────────
+# BirdCLEF submission container is CPU-only. Installing onnxruntime-gpu here
+# would just waste memory and spam errors about missing CUDA libs.
 
-def _preload_nvidia_cuda_libs():
-    """onnxruntime-gpu (CUDA 12 build) expects libcublasLt.so.12 etc. on the
-    loader path, but Kaggle ships CUDA via pip packages (nvidia-cublas-cu12,
-    nvidia-cudnn-cu12, ...) that aren't on LD_LIBRARY_PATH. We discover them
-    in site-packages, prepend them to LD_LIBRARY_PATH, and ctypes-preload the
-    key .so files so any later dlopen() from ORT resolves.
-    Must run BEFORE `import onnxruntime`.
-    """
-    import sys, pathlib, ctypes, glob
-    roots = []
-    for sp in sys.path:
-        p = pathlib.Path(sp) / 'nvidia'
-        if p.exists():
-            roots.append(p)
-    lib_dirs = []
-    for r in roots:
-        for sub in r.iterdir():
-            lib = sub / 'lib'
-            if lib.exists():
-                lib_dirs.append(str(lib))
-    if not lib_dirs:
-        return []
-
-    current = os.environ.get('LD_LIBRARY_PATH', '')
-    os.environ['LD_LIBRARY_PATH'] = ':'.join(lib_dirs + ([current] if current else []))
-
-    # ctypes-preload (order matters: dependencies first)
-    preload_order = [
-        'libcudart.so*', 'libnvrtc.so*', 'libcublasLt.so*', 'libcublas.so*',
-        'libcufft.so*', 'libcurand.so*', 'libcusparse.so*', 'libcusolver.so*',
-        'libnvJitLink.so*', 'libcudnn*.so*',
-    ]
-    loaded = []
-    for d in lib_dirs:
-        for pat in preload_order:
-            for so in sorted(glob.glob(os.path.join(d, pat))):
-                try:
-                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-                    loaded.append(os.path.basename(so))
-                except OSError:
-                    pass
-    return loaded
-
-
-def install_onnxruntime():
-    """Install onnxruntime-gpu (fallback: onnxruntime) from wheels dataset.
-    Skipped entirely if an onnxruntime build is already importable."""
+def install_onnxruntime_cpu():
+    """Install the CPU-only `onnxruntime` package from local wheels."""
     try:
         import onnxruntime  # noqa: F401
-        print(f'onnxruntime already importable: {onnxruntime.__version__}')
-        return
+        # If an onnxruntime-gpu was preinstalled on the image, force uninstall
+        # and replace with CPU — CUDA attempts will otherwise error-spam.
+        if 'gpu' in getattr(onnxruntime, '__file__', '').lower() or \
+           any('gpu' in d.lower() for d in getattr(onnxruntime, '__path__', [])):
+            subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y',
+                            'onnxruntime-gpu'], capture_output=True, text=True)
+        else:
+            print(f'onnxruntime already importable: {onnxruntime.__version__}')
+            return
     except Exception:
         pass
     if not WHEELS_DIR.exists():
         raise RuntimeError(f'No wheels dir: {WHEELS_DIR}')
     cmd = [sys.executable, '-m', 'pip', 'install',
-           '--no-index', '--find-links', str(WHEELS_DIR),
-           'onnxruntime-gpu']
+           '--no-index', '--find-links', str(WHEELS_DIR), 'onnxruntime']
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print('onnxruntime-gpu install failed, trying onnxruntime (CPU):')
-        print(r.stderr[-400:])
-        cmd[-1] = 'onnxruntime'
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f'Both installs failed: {r.stderr[-400:]}')
-    print(f'onnxruntime installed from {WHEELS_DIR}')
+        raise RuntimeError(f'onnxruntime (CPU) install failed: {r.stderr[-400:]}')
+    print(f'onnxruntime (CPU) installed from {WHEELS_DIR}')
 
 
-install_onnxruntime()
-_preloaded = _preload_nvidia_cuda_libs()
-if _preloaded:
-    print(f'Preloaded {len(_preloaded)} CUDA libs (cublasLt, cudnn, ...)')
-else:
-    print('No nvidia-* CUDA libs found in site-packages — ORT will use CPU only')
+install_onnxruntime_cpu()
 import onnxruntime as ort
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Submission container is CPU-only — force torch to CPU too so the mel
+# transform doesn't try to pick up a phantom CUDA device.
+DEVICE = torch.device('cpu')
+torch.set_num_threads(max(1, (os.cpu_count() or 4)))
 
 
 # ── TAXONOMY ──────────────────────────────────────────────────────────────────
@@ -200,20 +156,10 @@ class Spectrogram(nn.Module):
 
 # ── ONNX SESSIONS ─────────────────────────────────────────────────────────────
 
-def build_providers():
-    avail = ort.get_available_providers()
-    providers = []
-    if 'CUDAExecutionProvider' in avail:
-        providers.append(('CUDAExecutionProvider', {'device_id': 0,
-                                                    'arena_extend_strategy': 'kNextPowerOfTwo'}))
-    providers.append('CPUExecutionProvider')
-    return providers, avail
-
-
 def load_onnx_sessions(paths):
-    providers, avail = build_providers()
-    print(f'ORT providers available: {avail}')
-    print(f'ORT providers selected : {[p if isinstance(p, str) else p[0] for p in providers]}')
+    n_cpu = max(1, (os.cpu_count() or 4))
+    providers = ['CPUExecutionProvider']
+    print(f'ORT providers : {providers}  (cpu threads = {n_cpu})')
 
     sess_list = []
     for p in paths:
@@ -222,6 +168,9 @@ def load_onnx_sessions(paths):
             continue
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.intra_op_num_threads = n_cpu
+        so.inter_op_num_threads = 1
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         sess = ort.InferenceSession(str(p), sess_options=so, providers=providers)
         sess_list.append(sess)
         print(f'  Loaded ONNX: {Path(p).name}')
