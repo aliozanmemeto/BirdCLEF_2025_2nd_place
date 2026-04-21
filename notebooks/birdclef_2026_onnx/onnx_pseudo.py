@@ -4,13 +4,19 @@
 # runs via onnxruntime. Fold_id map, protected-file handling, TTA, thresholding
 # and CSV output are unchanged.
 #
-# Single architecture per run. Set BACKBONE_TAG to 'v2s' or 'nfnet' and list
-# the five ONNX paths for that backbone in fold order.
+# Supports SINGLE-ARCH or MULTI-ARCH ensembles. Set ARCHS to any subset of
+# {'v2s', 'nfnet'}. For labeled soundscapes (fold_id >= 0) only the matching
+# fold's model from each selected arch participates (OOF). For unlabeled
+# soundscapes (fold_id == -1) every loaded session participates.
 #
 # Prereqs:
-#   - onnx_export.py has been run and its /kaggle/working/onnx_assets folder
-#     is saved as a dataset mounted at ONNX_ROOT below.
-#   - Exactly 5 ONNX paths, in fold order (fold 0 .. fold 4).
+#   - onnx_export.py has been run with both v2s + nfnet checkpoints listed,
+#     and its /kaggle/working/onnx_assets folder is mounted at ONNX_ROOT below.
+#   - For each arch in ARCHS, exactly 5 ONNX paths (fold 0..4) must be supplied
+#     in ONNX_FOLD_PATHS[arch].
+#   - Both training runs (v2s + nfnet) must have used the same DUP_CSV_PATH
+#     content and the same FOLD_SEED, so the protected-file set and fold
+#     assignments are identical across architectures.
 
 import json, subprocess, sys
 from pathlib import Path
@@ -29,19 +35,35 @@ import torchaudio.transforms as T
 ROOT      = Path('/kaggle/input/competitions/birdclef-2026')
 ONNX_ROOT = Path('/kaggle/input/onnx-assets-v2s-nfnet')   # <-- edit to your mount
 
-BACKBONE_TAG = 'v2s'    # 'v2s' | 'nfnet'   (used only for output filename)
-OUT_PATH     = Path(f'./pseudo_labels_{BACKBONE_TAG}_oof.csv')
+# Which architectures to ensemble. Any subset of {'v2s', 'nfnet'}.
+#   ['v2s']            → v2s only          (output: pseudo_labels_v2s_oof.csv)
+#   ['nfnet']          → nfnet only        (output: pseudo_labels_nfnet_oof.csv)
+#   ['v2s', 'nfnet']   → ensemble of both  (output: pseudo_labels_v2s+nfnet_oof.csv)
+ARCHS = ['v2s', 'nfnet']
 
-# Fold models — MUST be in fold order [fold 0, fold 1, fold 2, fold 3, fold 4]
+# Fold models per arch — MUST be in fold order [fold 0, 1, 2, 3, 4].
+# Only the entries for archs you list in ARCHS are read.
 MODELS_DIR = ONNX_ROOT / 'models'
 WHEELS_DIR = ONNX_ROOT / 'wheels'
-ONNX_FOLD_PATHS = [
-    MODELS_DIR / 'v2s__best_sed_atthead_ns_fold0.onnx',
-    MODELS_DIR / 'v2s__best_sed_atthead_ns_fold1.onnx',
-    MODELS_DIR / 'v2s__best_sed_atthead_ns_fold2.onnx',
-    MODELS_DIR / 'v2s__best_sed_atthead_ns_fold3.onnx',
-    MODELS_DIR / 'v2s__best_sed_atthead_ns_fold4.onnx',
-]
+ONNX_FOLD_PATHS = {
+    'v2s': [
+        MODELS_DIR / 'v2s__best_sed_atthead_ns_fold0.onnx',
+        MODELS_DIR / 'v2s__best_sed_atthead_ns_fold1.onnx',
+        MODELS_DIR / 'v2s__best_sed_atthead_ns_fold2.onnx',
+        MODELS_DIR / 'v2s__best_sed_atthead_ns_fold3.onnx',
+        MODELS_DIR / 'v2s__best_sed_atthead_ns_fold4.onnx',
+    ],
+    'nfnet': [
+        MODELS_DIR / 'nfnet__best_eca_nfnet_ns_fold0.onnx',
+        MODELS_DIR / 'nfnet__best_eca_nfnet_ns_fold1.onnx',
+        MODELS_DIR / 'nfnet__best_eca_nfnet_ns_fold2.onnx',
+        MODELS_DIR / 'nfnet__best_eca_nfnet_ns_fold3.onnx',
+        MODELS_DIR / 'nfnet__best_eca_nfnet_ns_fold4.onnx',
+    ],
+}
+
+OUT_TAG  = '+'.join(ARCHS)
+OUT_PATH = Path(f'./pseudo_labels_{OUT_TAG}_oof.csv')
 
 FOLD_SEED = 1215          # MUST match training SEED
 N_FOLDS   = 5
@@ -296,20 +318,29 @@ def build_providers():
 
 
 def load_sessions():
+    """Returns sessions[arch][fold_id] -> InferenceSession.
+    Arch key always present even if some folds are missing."""
     providers, avail = build_providers()
     print(f'ORT providers available: {avail}')
     print(f'ORT providers selected : {[p if isinstance(p, str) else p[0] for p in providers]}')
     sessions = {}
-    for fold_i, p in enumerate(ONNX_FOLD_PATHS):
-        if not Path(p).exists():
-            print(f'  SKIP fold {fold_i} (not found): {p}')
-            continue
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sessions[fold_i] = ort.InferenceSession(str(p), sess_options=so, providers=providers)
-        print(f'  Fold {fold_i}: {Path(p).name}')
-    if not sessions:
+    total = 0
+    for arch in ARCHS:
+        if arch not in ONNX_FOLD_PATHS:
+            raise RuntimeError(f'ARCHS contains "{arch}" but ONNX_FOLD_PATHS has no entry for it')
+        sessions[arch] = {}
+        for fold_i, p in enumerate(ONNX_FOLD_PATHS[arch]):
+            if not Path(p).exists():
+                print(f'  SKIP {arch} fold {fold_i} (not found): {p}')
+                continue
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sessions[arch][fold_i] = ort.InferenceSession(str(p), sess_options=so, providers=providers)
+            print(f'  {arch}  fold {fold_i}: {Path(p).name}')
+            total += 1
+    if total == 0:
         raise RuntimeError('No ONNX sessions loaded')
+    print(f'  Loaded {total} sessions across {len(ARCHS)} arch(s): {ARCHS}')
     return sessions
 
 
@@ -391,16 +422,21 @@ def run():
                 specs       = mel(segs).cpu().numpy()
                 specs_shift = mel(segs_shift).cpu().numpy()
 
+        # Pick which sessions are OOF for this file.
+        #   fold_id == -1  → unlabeled  → ensemble EVERY loaded session
+        #   fold_id >=  0  → labeled    → only the matching fold's model from
+        #                                 each arch (those are the OOF ones)
         if fold_id == -1:
-            probs       = np.mean([sigmoid_np(s.run(None, {'spec': specs})[0])       for s in sessions.values()], axis=0)
-            probs_shift = np.mean([sigmoid_np(s.run(None, {'spec': specs_shift})[0]) for s in sessions.values()], axis=0)
+            active = [s for arch_sess in sessions.values() for s in arch_sess.values()]
         else:
-            if fold_id not in sessions:
-                skipped_no_model += 1
-                continue
-            sess = sessions[fold_id]
-            probs       = sigmoid_np(sess.run(None, {'spec': specs})[0])
-            probs_shift = sigmoid_np(sess.run(None, {'spec': specs_shift})[0])
+            active = [sessions[arch][fold_id] for arch in ARCHS
+                      if fold_id in sessions.get(arch, {})]
+        if not active:
+            skipped_no_model += 1
+            continue
+
+        probs       = np.mean([sigmoid_np(s.run(None, {'spec': specs})[0])       for s in active], axis=0)
+        probs_shift = np.mean([sigmoid_np(s.run(None, {'spec': specs_shift})[0]) for s in active], axis=0)
 
         preds = (probs + probs_shift) / 2.0   # (12, n_classes)
 
